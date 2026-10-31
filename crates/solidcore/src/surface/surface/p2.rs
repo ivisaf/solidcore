@@ -36,6 +36,7 @@
 //! | [`Surface::convert_uv_from_step_to_nurbs`], [`Surface::convert_uv_from_nurbs_to_step`] | `ConvertUVFromSTEPToNURBS`, `ConvertUVFromNURBSToSTEP` |
 //! | [`Surface::curve_on_classify`]                    | `CurveOnClassify`                                |
 //! | [`Surface::global_surface_intersect`], [`base_global_surface_intersect`], [`SurfaceIntersection`] | `GlobalSurfaceIntersect` (virtual: the `SmPlane` override in `surface::plane::p2`; the `SmSurface` body) |
+//! | [`Surface::global_surface_intersect_with_partial`] | `GlobalSurfaceIntersect` with the outputs left in the caller's arrays on a failure |
 //! | [`Surface::point_based_surface_intersect`], [`PointIntersection`] | `PointBasedSurfaceIntersect` (UV point version) |
 //! | [`Surface::read_from_db`]                         | `SmSurface::ReadFromDB`                          |
 //! | [`Surface::create_plane_with_3d_curves`], [`PlaneWith3dCurves`] | `CreatePlaneWith3DCurves`          |
@@ -63,6 +64,13 @@
 //! | [`IsoCurveLengthIntegrand`]                       | `SmIsoCurveLengthIFEO` (constructor)             |
 //!
 //! Deviations:
+//! - **Output arrays.** `GlobalSurfaceIntersect`'s output arrays are a
+//!   `&mut SurfaceIntersection` threaded through the kind dispatchers and the special
+//!   cases that can fail after appending (the `*_into` functions), so a failure leaves in
+//!   it what upstream leaves in the caller's arrays
+//!   ([`Surface::global_surface_intersect_with_partial`]). The general intersection
+//!   resets them first (`SmSurfaceIntersector::DoIntersection`): a special case that asks
+//!   for it keeps none of its own outputs.
 //! - **Touching loops** (not upstream, WR-405, tangency-labs/solidcore#892, opt-in
 //!   `Kernel::fixes.join_touching_loops`): `create_plane_with_3d_curves`
 //!   joins a loop touching another loop of its face at a vertex into that loop
@@ -266,7 +274,7 @@ use crate::surface::plane::Plane;
 use crate::surface::sphere::Sphere;
 use crate::surface::srf_in_volume::SrfInVolume;
 use crate::surface::surf_of_extrusion::SurfOfExtrusion;
-use crate::surface::surf_of_revolution::p3::intersect_revolved;
+use crate::surface::surf_of_revolution::p3::intersect_revolved_into;
 use crate::surface::surf_of_revolution::{Revolved, SurfOfRevolution};
 use crate::surface::surface::p1::{StepSurface, SurfaceIntersectContext, SurfaceSolveContext};
 use crate::surface::surface::p8::BoundaryMemo;
@@ -591,7 +599,7 @@ impl Clone for Surface {
 impl Surface {
     /// A temporary evaluation copy: retain the owner and exact NURBS data rather
     /// than invoking the upstream copy constructor's knot fix-up.
-    pub(crate) fn clone_for_evaluation(&self) -> Result<Self> {
+    pub fn clone_for_evaluation(&self) -> Result<Self> {
         self.clone_for_evaluation_depth(0)
     }
 
@@ -659,6 +667,42 @@ pub(crate) enum NestedGeometry<'a> {
     Volume(&'a crate::surface::volume::Volume),
 }
 
+/// The entries [`PendingGeometry`] holds without a heap allocation.
+const PENDING_INLINE: usize = 8;
+
+/// The work stack of [`check_geometry_nesting`]: the first [`PENDING_INLINE`]
+/// entries on the stack, the rest on the heap, so the walk of a shallow geometry (an
+/// analytic surface and its generating curve, checked on every evaluation)
+/// allocates nothing. One last-in, first-out stack: an entry goes inline only while
+/// none is on the heap, and the heap ones are taken first.
+#[derive(Default)]
+struct PendingGeometry<'a> {
+    inline: [Option<(NestedGeometry<'a>, usize)>; PENDING_INLINE],
+    inline_len: usize,
+    spill: Vec<(NestedGeometry<'a>, usize)>,
+}
+
+impl<'a> PendingGeometry<'a> {
+    fn push(&mut self, entry: (NestedGeometry<'a>, usize)) {
+        if self.spill.is_empty() {
+            if let Some(slot) = self.inline.get_mut(self.inline_len) {
+                *slot = Some(entry);
+                self.inline_len += 1;
+                return;
+            }
+        }
+        self.spill.push(entry);
+    }
+
+    fn pop(&mut self) -> Option<(NestedGeometry<'a>, usize)> {
+        if let Some(entry) = self.spill.pop() {
+            return Some(entry);
+        }
+        self.inline_len = self.inline_len.checked_sub(1)?;
+        self.inline.get_mut(self.inline_len)?.take()
+    }
+}
+
 /// Walk `root` without recursion and fail when any owned geometry lies deeper than
 /// [`MAX_GEOMETRY_NESTING`], counting `root` itself at `initial_depth`. A wrapper
 /// constructor passes its new inner geometry at depth 1.
@@ -673,7 +717,8 @@ pub(crate) fn check_geometry_nesting(
 ) -> Result<()> {
     use crate::curve::curve::CurveKind;
     type Geometry<'a> = NestedGeometry<'a>;
-    let mut pending = vec![(root, initial_depth)];
+    let mut pending = PendingGeometry::default();
+    pending.push((root, initial_depth));
     while let Some((geometry, depth)) = pending.pop() {
         if depth > MAX_GEOMETRY_NESTING {
             return Err(SolidError::invalid_input(
@@ -801,6 +846,7 @@ impl Surface {
                 minor_radius: s.minor_radius,
                 // The copy constructor resets this flag; an evaluation copy must not.
                 inside_out: s.inside_out,
+                keeps_inside_out: s.keeps_inside_out,
             })),
             SurfaceKind::SurfOfRevolution(s) => {
                 SurfaceKind::SurfOfRevolution(Box::new(s.clone_for_evaluation(depth + 1)?))
@@ -2373,8 +2419,10 @@ impl Surface {
                 s.base()
                     .step_inversion_on(k, self, anal_domain, point_on_surf, tol_3d, uv_guess)
             }
+            // SmCone::STEPInversion ignores crAnalDomain: it inverts over its own
+            // m_vAnalUVDomain (only the non-planar generator branch reads the domain)
             SurfaceKind::Cone(s) => s
-                .step_inversion_on_domain(k, anal_domain, point_on_surf, tol_3d, uv_guess)
+                .step_inversion(k, point_on_surf, tol_3d, uv_guess)
                 .and_then(|r| {
                     if r.inside {
                         Ok((r.uv, r.location))
@@ -2601,9 +2649,16 @@ impl Surface {
                     crate::surface::plane::p2::PlaneOwner::NoFace,
                 ],
             ),
-            SurfaceKind::Cone(s) => {
-                s.intersect_with_plane(k, uv_domain, plane, other_uv_domain, approx_tol_3d)
-            }
+            // the plane is taken as without owner; this cone's face tolerance is for WR-510
+            SurfaceKind::Cone(s) => s.intersect_with_plane_owned(
+                k,
+                uv_domain,
+                plane,
+                crate::surface::plane::p2::PlaneOwner::NoFace,
+                other_uv_domain,
+                approx_tol_3d,
+                [self.owner_zone_tol_3d(), None],
+            ),
             SurfaceKind::Sphere(s) => {
                 s.intersect_with_plane(k, uv_domain, plane, other_uv_domain, approx_tol_3d)
             }
@@ -3364,8 +3419,70 @@ impl Surface {
         ang_tol_rad: Option<f64>,
         context: Option<SurfaceIntersectContext<'_, O>>,
     ) -> Result<SurfaceIntersection> {
+        let mut out = SurfaceIntersection::default();
+        self.global_surface_intersect_into(
+            k,
+            uv_domain,
+            other,
+            other_uv_domain,
+            use_surface_edges,
+            approx_tol_3d,
+            ang_tol_rad,
+            context,
+            &mut out,
+        )?;
+        Ok(out)
+    }
+
+    /// [`Surface::global_surface_intersect`] with the outputs upstream leaves in the
+    /// caller's arrays also on a failure (`SmApiIntersectSurfaces` hands its array to
+    /// `GlobalSurfaceIntersect` and keeps what is in it): on an error, the curves the
+    /// failing special-case intersection appended before it (the general intersection
+    /// resets the arrays first).
+    #[allow(clippy::too_many_arguments)]
+    pub fn global_surface_intersect_with_partial(
+        &self,
+        k: &Kernel,
+        uv_domain: &Extent2d,
+        other: &Self,
+        other_uv_domain: &Extent2d,
+        use_surface_edges: [bool; 2],
+        approx_tol_3d: Option<f64>,
+        ang_tol_rad: Option<f64>,
+    ) -> (SurfaceIntersection, Result<()>) {
+        let mut out = SurfaceIntersection::default();
+        let status = self.global_surface_intersect_into(
+            k,
+            uv_domain,
+            other,
+            other_uv_domain,
+            use_surface_edges,
+            approx_tol_3d,
+            ang_tol_rad,
+            None::<SurfaceIntersectContext<'_, crate::surface::surface::p4::NoObject>>,
+            &mut out,
+        );
+        (out, status)
+    }
+
+    /// [`Surface::global_surface_intersect_in`] into `out` (upstream's output arrays):
+    /// the kind's override fills it; on an error `out` keeps what the failing
+    /// special-case intersection appended before it.
+    #[allow(clippy::too_many_arguments)]
+    fn global_surface_intersect_into<O: SolutionObject + Copy + PartialEq>(
+        &self,
+        k: &Kernel,
+        uv_domain: &Extent2d,
+        other: &Self,
+        other_uv_domain: &Extent2d,
+        use_surface_edges: [bool; 2],
+        approx_tol_3d: Option<f64>,
+        ang_tol_rad: Option<f64>,
+        context: Option<SurfaceIntersectContext<'_, O>>,
+        out: &mut SurfaceIntersection,
+    ) -> Result<()> {
         match self.kind_with_nurb(k)? {
-            SurfaceKind::Plane(p) => crate::surface::plane::p2::global_surface_intersect_in(
+            SurfaceKind::Plane(p) => crate::surface::plane::p2::global_surface_intersect_into(
                 k,
                 self,
                 p,
@@ -3376,10 +3493,11 @@ impl Surface {
                 approx_tol_3d,
                 ang_tol_rad,
                 context,
+                out,
             ),
             // SmCone::GlobalSurfaceIntersect: its special cases, else the base
             // SmSurface::GlobalSurfaceIntersect of this surface
-            SurfaceKind::Cone(c) => c.global_surface_intersect_on(
+            SurfaceKind::Cone(c) => c.global_surface_intersect_on_into(
                 Some(self),
                 k,
                 uv_domain,
@@ -3388,8 +3506,8 @@ impl Surface {
                 use_surface_edges,
                 approx_tol_3d,
                 ang_tol_rad,
-                |req| {
-                    base_global_surface_intersect_in(
+                |req, out| {
+                    base_global_surface_intersect_into(
                         req.kernel,
                         self,
                         req.domain,
@@ -3399,12 +3517,14 @@ impl Surface {
                         req.approx_tol_3d,
                         req.ang_tol_rad,
                         context,
+                        out,
                     )
                 },
+                out,
             ),
             // SmSphere::GlobalSurfaceIntersect: its special cases, else the base
             // SmSurface::GlobalSurfaceIntersect of this surface
-            SurfaceKind::Sphere(s) => s.global_surface_intersect_with(
+            SurfaceKind::Sphere(s) => s.global_surface_intersect_with_into(
                 k,
                 uv_domain,
                 other,
@@ -3412,8 +3532,8 @@ impl Surface {
                 use_surface_edges,
                 approx_tol_3d,
                 ang_tol_rad,
-                |k| {
-                    base_global_surface_intersect_in(
+                |k, out| {
+                    base_global_surface_intersect_into(
                         k,
                         self,
                         uv_domain,
@@ -3423,56 +3543,65 @@ impl Surface {
                         approx_tol_3d,
                         ang_tol_rad,
                         context,
+                        out,
                     )
                 },
+                out,
             ),
             // the inherited SmSurfOfRevolution::GlobalSurfaceIntersect: the plane
             // special case runs the inherited IntersectWithPlane with the torus's iso
             // circles, the sphere, cone and surface of revolution cases the inherited
             // intersections with the torus's domain conversion; each then takes the
-            // general intersection when it needs more (its curves follow: upstream
-            // appends to the same arrays); any other surface takes the general
-            // intersection
+            // general intersection when it needs more (which resets the output arrays
+            // first: SmSurfaceIntersector::DoIntersection); any other surface takes the
+            // general intersection
             SurfaceKind::Torus(t) => {
+                // (each special case resets the outputs on entry)
+                *out = SurfaceIntersection::default();
                 // IntersectWithSphere / IntersectWithCone: a planar generator, else
                 // the general intersection
-                let revolved = |other: &dyn Revolved| -> Result<(bool, SurfaceIntersection)> {
+                let revolved = |other: &dyn Revolved, out: &mut SurfaceIntersection| {
                     if !t.base().planar_generator {
-                        return Ok((true, SurfaceIntersection::default()));
+                        return Ok(true);
                     }
-                    intersect_revolved(
+                    intersect_revolved_into(
                         t.as_ref(),
                         k,
                         uv_domain,
                         other,
                         other_uv_domain,
                         approx_tol_3d,
+                        out,
                     )
                 };
-                let (more, mut out) = match other.kind_with_nurb(k)? {
+                let more = match other.kind_with_nurb(k)? {
                     // the plane's boxes take its face's tolerance
-                    SurfaceKind::Plane(p) => t.intersect_with_plane_owned(
+                    SurfaceKind::Plane(p) => t.intersect_with_plane_owned_into(
                         k,
                         p,
                         crate::surface::plane::p2::PlaneOwner::of(other)?,
                         other_uv_domain,
                         approx_tol_3d,
+                        out,
                     )?,
-                    SurfaceKind::Sphere(o) => revolved(o.as_ref())?,
-                    SurfaceKind::Cone(o) if o.type_code() == CONE_TYPE => revolved(o.as_ref())?,
+                    SurfaceKind::Sphere(o) => revolved(o.as_ref(), out)?,
+                    SurfaceKind::Cone(o) if o.type_code() == CONE_TYPE => {
+                        revolved(o.as_ref(), out)?
+                    }
                     // (IntersectWithSurfOfRevolution checks the generator itself)
-                    SurfaceKind::SurfOfRevolution(o) => intersect_revolved(
+                    SurfaceKind::SurfOfRevolution(o) => intersect_revolved_into(
                         t.as_ref(),
                         k,
                         uv_domain,
                         o.as_ref(),
                         other_uv_domain,
                         approx_tol_3d,
+                        out,
                     )?,
-                    _ => (true, SurfaceIntersection::default()),
+                    _ => true,
                 };
                 if more {
-                    let more = base_global_surface_intersect_in(
+                    base_global_surface_intersect_into(
                         k,
                         self,
                         uv_domain,
@@ -3482,16 +3611,12 @@ impl Surface {
                         approx_tol_3d,
                         ang_tol_rad,
                         context,
+                        out,
                     )?;
-                    out.curves_3d.extend(more.curves_3d);
-                    out.surface1_uv_curves.extend(more.surface1_uv_curves);
-                    out.surface2_uv_curves.extend(more.surface2_uv_curves);
-                    out.curve_types.extend(more.curve_types);
-                    out.deviations.extend(more.deviations);
                 }
-                Ok(out)
+                Ok(())
             }
-            SurfaceKind::SurfOfRevolution(s) => s.global_surface_intersect_in(
+            SurfaceKind::SurfOfRevolution(s) => s.global_surface_intersect_into(
                 self,
                 k,
                 uv_domain,
@@ -3501,23 +3626,30 @@ impl Surface {
                 approx_tol_3d,
                 ang_tol_rad,
                 context,
+                out,
             ),
-            SurfaceKind::SurfOfExtrusion(s) => s.global_surface_intersect_on_in(
-                k,
-                self,
-                uv_domain,
-                other,
-                other_uv_domain,
-                use_surface_edges,
-                approx_tol_3d,
-                ang_tol_rad,
-                context,
-            ),
+            // (its special cases append nothing before an error: the result replaces
+            // the outputs, which stay empty on an error)
+            SurfaceKind::SurfOfExtrusion(s) => {
+                *out = SurfaceIntersection::default();
+                *out = s.global_surface_intersect_on_in(
+                    k,
+                    self,
+                    uv_domain,
+                    other,
+                    other_uv_domain,
+                    use_surface_edges,
+                    approx_tol_3d,
+                    ang_tol_rad,
+                    context,
+                )?;
+                Ok(())
+            }
             SurfaceKind::BSpline(_)
             | SurfaceKind::CurveBounded(_)
             | SurfaceKind::Step(_)
             | SurfaceKind::OffsetSurface(_)
-            | SurfaceKind::SrfInVolume(_) => base_global_surface_intersect_in(
+            | SurfaceKind::SrfInVolume(_) => base_global_surface_intersect_into(
                 k,
                 self,
                 uv_domain,
@@ -3527,6 +3659,7 @@ impl Surface {
                 approx_tol_3d,
                 ang_tol_rad,
                 context,
+                out,
             ),
         }
     }
@@ -4277,6 +4410,38 @@ pub(crate) fn base_global_surface_intersect_in<O: SolutionObject + Copy + Partia
             ang_tol_rad,
         ),
     }
+}
+
+/// [`base_global_surface_intersect_in`] into `out`: `SmSurfaceIntersector::DoIntersection`
+/// resets the output arrays first, then sets them. Its only append before a later error
+/// (`GrazingBoxProcess`'s touching point, whose UV degenerate curves cannot fail for a
+/// corner inside the domains) is not reached, so on an error `out` is empty.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn base_global_surface_intersect_into<O: SolutionObject + Copy + PartialEq>(
+    k: &Kernel,
+    this: &Surface,
+    uv_domain: &Extent2d,
+    other: &Surface,
+    other_uv_domain: &Extent2d,
+    use_surface_edges: [bool; 2],
+    approx_tol_3d: Option<f64>,
+    ang_tol_rad: Option<f64>,
+    context: Option<SurfaceIntersectContext<'_, O>>,
+    out: &mut SurfaceIntersection,
+) -> Result<()> {
+    *out = SurfaceIntersection::default();
+    *out = base_global_surface_intersect_in(
+        k,
+        this,
+        uv_domain,
+        other,
+        other_uv_domain,
+        use_surface_edges,
+        approx_tol_3d,
+        ang_tol_rad,
+        context,
+    )?;
+    Ok(())
 }
 
 /// `SmSurface::GetMaxAnalyticDomain`: reports `SM_ERR` and returns an initialised
@@ -6947,6 +7112,40 @@ mod tests {
         let mut unowned = in_volume(2);
         assert!(run(&mut unowned).is_err());
         assert!(unowned.notify_key().is_none());
+    }
+
+    #[test]
+    fn pending_geometry_is_one_lifo_stack_past_its_inline_entries() {
+        let plane = Surface::from(Plane::from_normal(Vec3::ZERO, Vec3::Z));
+        let mut pending = PendingGeometry::default();
+        let mut popped = Vec::new();
+        // interleaved pushes and pops across the inline/heap boundary
+        for round in 0..3 {
+            for depth in 0..(PENDING_INLINE + 5) {
+                pending.push((NestedGeometry::Surface(&plane), 100 * round + depth));
+            }
+            for _ in 0..4 {
+                popped.push(pending.pop().map(|(_, d)| d));
+            }
+        }
+        while let Some((_, d)) = pending.pop() {
+            popped.push(Some(d));
+        }
+        let mut model = Vec::new();
+        let mut expect = Vec::new();
+        for round in 0..3 {
+            for depth in 0..(PENDING_INLINE + 5) {
+                model.push(100 * round + depth);
+            }
+            for _ in 0..4 {
+                expect.push(model.pop());
+            }
+        }
+        while let Some(d) = model.pop() {
+            expect.push(Some(d));
+        }
+        assert_eq!(popped, expect);
+        assert!(pending.pop().is_none());
     }
 
     #[test]
